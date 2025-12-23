@@ -259,12 +259,16 @@ resource "aws_ecs_task_definition" "app" {
         }
       }
 
+      # Health check configuration
+      # IMPORTANT: wget must be installed in Dockerfile (see Dockerfile line 29)
+      # Uses full path /usr/bin/wget to ensure it's found when running as nextjs user
+      # startPeriod of 90s gives Next.js time to fully start before health checks begin
       healthCheck = {
-        command     = ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000 || exit 1"]
-        interval    = 30
-        timeout     = 5
-        retries     = 3
-        startPeriod = 60
+        command     = ["CMD-SHELL", "/usr/bin/wget --no-verbose --tries=1 --spider http://localhost:3000 || exit 1"]
+        interval    = 30  # Check every 30 seconds
+        timeout     = 10  # 10 second timeout per check
+        retries     = 3   # Retry 3 times before marking unhealthy
+        startPeriod = 90  # 90 second grace period before health checks start
       }
     }
   ])

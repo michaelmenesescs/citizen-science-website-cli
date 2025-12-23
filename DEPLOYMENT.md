@@ -1,233 +1,135 @@
-# ECS Fargate Deployment Guide
+# Deployment Guide
 
-This guide walks you through deploying the Citizen Science website to AWS ECS Fargate.
+This guide walks you through deploying the Citizen Science website to AWS.
 
 ## Architecture Overview
 
 ```
-GitHub → GitHub Actions → ECR (Docker Registry) → ECS Fargate (Public IP) → Users
+Internet → CloudFront (CDN) → Network Load Balancer → ECS Fargate → Next.js App
 ```
 
-**Cost-optimized setup**: No load balancer, single subnet, minimal resources (~$10-15/month)
+**Current Setup**: CloudFront + NLB + ECS Fargate (~$15-22/month)
+
+**Domains**: 
+- `citizensciencemusic.com`
+- `www.citizensciencemusic.com`
+- CloudFront: `d35bp93zf2ayyg.cloudfront.net`
 
 ## Prerequisites
 
 1. AWS Account with appropriate permissions
 2. AWS CLI installed and configured (`aws configure`)
 3. Docker installed (for local testing)
-4. GitHub repository with Actions enabled
+4. Terraform installed (for infrastructure management)
+5. Domain name configured in Route 53 (optional, for custom domain)
 
-## Step 1: Create AWS Resources
+## Infrastructure Setup
 
-### 1.1 Create ECR Repository
+The infrastructure is managed via Terraform. See `INFRASTRUCTURE.md` for detailed architecture documentation.
+
+### Quick Start
 
 ```bash
-aws ecr create-repository \
-  --repository-name citizen-science-website \
-  --region us-east-1
+cd terraform
+terraform init
+terraform plan
+terraform apply
 ```
 
-Note the repository URI (e.g., `123456789012.dkr.ecr.us-east-1.amazonaws.com/citizen-science-website`)
+This creates:
+- ECR repository
+- ECS cluster, service, and task definition
+- Network Load Balancer
+- Security groups
+- IAM roles
+- CloudWatch log group
 
-### 1.2 Create ECS Cluster
+**Note**: CloudFront distribution is managed separately (not in Terraform).
+
+## Step 1: Build and Push Docker Image
+
+### Get ECR Repository URL
 
 ```bash
-aws ecs create-cluster \
-  --cluster-name citizen-science-cluster \
-  --region us-east-1
+# Get repository URL from Terraform output
+cd terraform
+ECR_URL=$(terraform output -raw ecr_repository_url)
+echo "ECR URL: $ECR_URL"
 ```
 
-### 1.3 Create IAM Roles
-
-**Execution Role** (allows ECS to pull images from ECR):
-
+Or get it directly:
 ```bash
-# Create trust policy
-cat > trust-policy.json <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "ecs-tasks.amazonaws.com"
-      },
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}
-EOF
-
-# Create role
-aws iam create-role \
-  --role-name ecsTaskExecutionRole \
-  --assume-role-policy-document file://trust-policy.json
-
-# Attach managed policy
-aws iam attach-role-policy \
-  --role-name ecsTaskExecutionRole \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws ecr describe-repositories \
+  --repository-names citizen-science-website \
+  --query 'repositories[0].repositoryUri' \
+  --output text
 ```
 
-**Task Role** (for the running container - minimal for now):
+### Build Docker Image
+
+**IMPORTANT**: Always build for `linux/amd64` architecture (ECS Fargate uses x86_64):
 
 ```bash
-aws iam create-role \
-  --role-name ecsTaskRole \
-  --assume-role-policy-document file://trust-policy.json
+# Login to ECR
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username AWS --password-stdin \
+  <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
+
+# Build for correct platform
+docker build --platform linux/amd64 -t citizen-science-website .
+
+# Tag image
+docker tag citizen-science-website:latest \
+  <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/citizen-science-website:latest
+
+# Push to ECR
+docker push <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/citizen-science-website:latest
 ```
 
-### 1.4 Create CloudWatch Log Group
+**Key Points**:
+- Use `--platform linux/amd64` flag (Mac builds ARM by default)
+- Image must include `wget` for health checks (see Dockerfile)
+- Tag as `:latest` for automatic deployment
+
+## Step 2: Deploy to ECS
+
+After pushing the image, force a new deployment:
 
 ```bash
-aws logs create-log-group \
-  --log-group-name /ecs/citizen-science-task \
-  --region us-east-1
-```
-
-### 1.5 Get Default VPC and Subnet (Cost-Free)
-
-Use AWS default VPC to avoid setup complexity:
-
-```bash
-# Get default VPC ID
-VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
-echo "Default VPC ID: $VPC_ID"
-
-# Get default subnet (any one is fine for single instance)
-SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[0].SubnetId" --output text)
-echo "Default Subnet ID: $SUBNET_ID"
-```
-
-### 1.6 Create Security Group
-
-```bash
-# Get default VPC ID first
-VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
-
-# Create security group
-SG_ID=$(aws ec2 create-security-group \
-  --group-name citizen-science-sg \
-  --description "Security group for Citizen Science website" \
-  --vpc-id $VPC_ID \
-  --query 'GroupId' \
-  --output text)
-
-echo "Security Group ID: $SG_ID"
-
-# Allow HTTP traffic on port 3000
-aws ec2 authorize-security-group-ingress \
-  --group-id $SG_ID \
-  --protocol tcp \
-  --port 3000 \
-  --cidr 0.0.0.0/0
-
-# Optional: Allow HTTPS if you add SSL later
-aws ec2 authorize-security-group-ingress \
-  --group-id $SG_ID \
-  --protocol tcp \
-  --port 443 \
-  --cidr 0.0.0.0/0
-```
-
-**Note:** We're using direct public IP access (no load balancer) to save costs.
-
-## Step 2: Update Task Definition
-
-1. Open `ecs-task-definition.json`
-2. Replace `YOUR_ACCOUNT_ID` with your AWS account ID (12 digits)
-3. Update the image URI with your ECR repository URI
-4. Update execution and task role ARNs with your account ID
-
-### Register Task Definition
-
-```bash
-aws ecs register-task-definition \
-  --cli-input-json file://ecs-task-definition.json \
-  --region us-east-1
-```
-
-## Step 3: Create ECS Service
-
-Create the service with direct public IP (no load balancer to save costs):
-
-```bash
-# Set variables (replace with your values from Step 1.5 and 1.6)
-VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
-SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[0].SubnetId" --output text)
-SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=citizen-science-sg" --query "SecurityGroups[0].GroupId" --output text)
-
-# Create ECS service
-aws ecs create-service \
+aws ecs update-service \
   --cluster citizen-science-cluster \
-  --service-name citizen-science-service \
-  --task-definition citizen-science-task \
-  --desired-count 1 \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+  --service citizen-science-service \
+  --force-new-deployment \
   --region us-east-1
 ```
 
-**Note:** Using single subnet and direct public IP - no load balancer needed for personal site.
-
-## Step 4: Configure GitHub Secrets
-
-In your GitHub repository, go to Settings → Secrets and variables → Actions, and add:
-
-- `AWS_ACCESS_KEY_ID`: Your AWS access key
-- `AWS_SECRET_ACCESS_KEY`: Your AWS secret key
-
-**Create IAM User for GitHub Actions:**
+Monitor the deployment:
 
 ```bash
-aws iam create-user --user-name github-actions-deploy
+# Watch service status
+watch -n 5 'aws ecs describe-services \
+  --cluster citizen-science-cluster \
+  --services citizen-science-service \
+  --query "services[0].{Running:runningCount,Desired:desiredCount}" \
+  --output json'
 
-# Create policy for ECS/ECR access
-cat > github-actions-policy.json <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ecr:GetAuthorizationToken",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage",
-        "ecr:PutImage",
-        "ecr:InitiateLayerUpload",
-        "ecr:UploadLayerPart",
-        "ecr:CompleteLayerUpload",
-        "ecs:DescribeServices",
-        "ecs:DescribeTaskDefinition",
-        "ecs:DescribeTasks",
-        "ecs:ListTasks",
-        "ecs:RegisterTaskDefinition",
-        "ecs:UpdateService"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "iam:PassRole"
-      ],
-      "Resource": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole"
-    }
-  ]
-}
-EOF
-
-aws iam put-user-policy \
-  --user-name github-actions-deploy \
-  --policy-name ECSDeployPolicy \
-  --policy-document file://github-actions-policy.json
-
-# Create access keys
-aws iam create-access-key --user-name github-actions-deploy
+# View logs
+aws logs tail /ecs/citizen-science-task --follow
 ```
 
-## Step 5: Test Locally
+## Step 3: Invalidate CloudFront Cache
+
+After deployment, invalidate CloudFront cache to serve new content:
+
+```bash
+aws cloudfront create-invalidation \
+  --distribution-id E2M1KYGNR5D6FH \
+  --paths "/*"
+```
+
+Wait 1-2 minutes for invalidation to complete, then test your site.
+
+## Step 4: Test Locally
 
 ```bash
 # Build and test Docker image locally
@@ -238,112 +140,137 @@ docker run -p 3000:3000 citizen-science-website
 docker-compose up
 ```
 
-## Step 6: First Manual Deployment
+## Step 5: Verify Deployment
 
-```bash
-# Get ECR login token
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
+### Check Service Status
 
-# Build and push
-docker build -t citizen-science-website .
-docker tag citizen-science-website:latest <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/citizen-science-website:latest
-docker push <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/citizen-science-website:latest
-
-# Update service to force new deployment
-aws ecs update-service \
-  --cluster citizen-science-cluster \
-  --service citizen-science-service \
-  --force-new-deployment \
-  --region us-east-1
-```
-
-## Step 7: Verify Deployment
-
-1. Check ECS service status:
 ```bash
 aws ecs describe-services \
   --cluster citizen-science-cluster \
   --services citizen-science-service \
-  --region us-east-1
+  --query 'services[0].{Status:status,RunningCount:runningCount,DesiredCount:desiredCount}' \
+  --output json
 ```
 
-2. Get task public IP:
+### Check Target Health
 
-**Easy way** (using helper script):
 ```bash
-./scripts/get-public-ip.sh
+aws elbv2 describe-target-health \
+  --target-group-arn $(aws elbv2 describe-target-groups \
+    --names citizen-science-tg \
+    --query 'TargetGroups[0].TargetGroupArn' \
+    --output text)
 ```
 
-**Manual way**:
+### Test Endpoints
+
 ```bash
-# Get task ARN
-TASK_ARN=$(aws ecs list-tasks --cluster citizen-science-cluster --service-name citizen-science-service --query "taskArns[0]" --output text)
+# Test NLB directly
+curl -I http://citizen-science-nlb-0bc7103c85b818a5.elb.us-east-1.amazonaws.com/
 
-# Get network interface ID
-NETWORK_INTERFACE_ID=$(aws ecs describe-tasks --cluster citizen-science-cluster --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+# Test CloudFront
+curl -I https://d35bp93zf2ayyg.cloudfront.net/
 
-# Get public IP
-aws ec2 describe-network-interfaces --network-interface-ids $NETWORK_INTERFACE_ID --query "NetworkInterfaces[0].Association.PublicIp" --output text
+# Test custom domain
+curl -I https://citizensciencemusic.com/
 ```
 
-3. Access your site at `http://<PUBLIC_IP>:3000`
-
-**Note:** The public IP may change when the task restarts. For a stable URL, consider:
-- Using Route 53 with a dynamic DNS script
-- Or adding a simple CloudFront distribution (adds ~$1/month)
+All should return `HTTP/2 200` or `HTTP/1.1 200`.
 
 ## Troubleshooting
 
 ### View Logs
+
 ```bash
+# Follow logs in real-time
 aws logs tail /ecs/citizen-science-task --follow
+
+# View recent logs
+aws logs tail /ecs/citizen-science-task --since 30m
 ```
 
 ### Check Task Status
+
 ```bash
-aws ecs describe-tasks --cluster citizen-science-cluster --tasks <TASK_ID>
+# List running tasks
+aws ecs list-tasks --cluster citizen-science-cluster --desired-status RUNNING
+
+# Describe specific task
+aws ecs describe-tasks \
+  --cluster citizen-science-cluster \
+  --tasks <TASK_ARN> \
+  --query 'tasks[0].{Status:lastStatus,Health:healthStatus,StoppedReason:stoppedReason}'
 ```
 
 ### Common Issues
 
-1. **Task fails to start**: Check CloudWatch logs, verify IAM roles
-2. **Can't pull image**: Verify ECR permissions on execution role
-3. **Can't access site**: Check security group rules, verify public IP assignment
-4. **Build fails in GitHub Actions**: Verify AWS credentials and region
+#### 1. Tasks Failing Health Checks
 
-## Cost Estimate (Minimal Setup)
+**Symptoms**: Tasks start but stop with "Task failed container health checks"
 
-- **ECS Fargate** (0.25 vCPU, 0.5GB RAM): ~$10-15/month
-  - $0.04048 per vCPU-hour × 730 hours = ~$7.50
-  - $0.004445 per GB-hour × 512MB × 730 hours = ~$1.66
-- **ECR storage**: ~$0.10/GB/month (first 500MB free)
+**Solutions**:
+- Verify `wget` is installed in Dockerfile
+- Check health check timeout/start period in task definition
+- Ensure Next.js binds to `0.0.0.0:3000` (check `HOSTNAME` env var)
+- Review CloudWatch logs for application errors
+
+#### 2. CloudFront Returns 404
+
+**Symptoms**: Direct NLB access works, CloudFront returns 404
+
+**Solutions**:
+- **Critical**: Ensure CloudFront `DefaultRootObject` is **empty** (`""`)
+- Verify origin points to correct NLB DNS name
+- Check origin request policy configuration
+- Invalidate CloudFront cache: `aws cloudfront create-invalidation --distribution-id E2M1KYGNR5D6FH --paths "/*"`
+
+#### 3. Architecture Mismatch Error
+
+**Symptoms**: "exec format error" in logs
+
+**Solution**: Always build with `--platform linux/amd64`:
+```bash
+docker build --platform linux/amd64 -t citizen-science-website .
+```
+
+#### 4. Can't Pull Image
+
+**Solutions**:
+- Verify ECR permissions on execution role
+- Check image tag exists in ECR
+- Ensure correct region
+
+#### 5. NLB Timeout
+
+**Symptoms**: CloudFront shows "Error from cloudfront", NLB times out
+
+**Solutions**:
+- Check ECS tasks are running and healthy
+- Verify security group allows traffic from NLB
+- Check target group health status
+- Review ECS service events for errors
+
+## Cost Breakdown
+
+- **ECS Fargate** (256 CPU, 512MB RAM): ~$10-15/month
+- **Network Load Balancer**: ~$3-4/month (much cheaper than ALB)
+- **CloudFront**: ~$1-2/month (data transfer)
+- **ECR Storage**: ~$0.10/GB/month (first 500MB free)
 - **CloudWatch Logs**: First 5GB free, then $0.50/GB
-- **Data transfer**: First 1GB free, then $0.09/GB
-- **VPC/Networking**: Free (using default VPC)
+- **Route 53**: ~$0.50/month per hosted zone
 
-**Total: ~$10-15/month** (assuming low traffic)
+**Total: ~$15-22/month** (assuming low traffic)
 
-**Cost-saving tips:**
-- No load balancer (saves $16/month)
+**Cost Optimization**:
+- Using NLB instead of ALB (saves ~$12/month)
 - Single task instance (no HA)
 - Minimal resources (256 CPU, 512MB RAM)
 - Using default VPC (no extra networking costs)
 
-## Next Steps (Optional)
+## Stopping/Starting Service
 
-- **Domain + SSL**: Use Route 53 + ACM certificate (free SSL, ~$0.50/month for domain)
-- **CloudFront**: Add CDN for static assets (~$1/month, improves performance)
-- **Auto-scaling**: Not needed for personal site, but can add if traffic grows
-- **CloudWatch Alarms**: Monitor costs and uptime (free tier available)
+To stop the service and save money:
 
-## Important Notes
-
-⚠️ **Public IP Changes**: The public IP will change when the task restarts. For a stable URL:
-- Use a dynamic DNS service
-- Or set up Route 53 with a script to update the A record
-- Or use CloudFront (adds minimal cost but provides stable URL)
-
-💡 **Stopping Costs**: To stop the service and save money:
 ```bash
 aws ecs update-service \
   --cluster citizen-science-cluster \
@@ -353,6 +280,7 @@ aws ecs update-service \
 ```
 
 To restart:
+
 ```bash
 aws ecs update-service \
   --cluster citizen-science-cluster \
@@ -360,4 +288,20 @@ aws ecs update-service \
   --desired-count 1 \
   --region us-east-1
 ```
+
+## Additional Resources
+
+- **Infrastructure Details**: See `INFRASTRUCTURE.md` for architecture documentation
+- **Terraform State**: Infrastructure is managed in `terraform/` directory
+- **Scripts**: Helper scripts in `scripts/` directory
+  - `get-public-ip.sh` - Get ECS task public IP
+  - `update-cloudfront.sh` - Update CloudFront origin (if needed)
+
+## Next Steps (Optional)
+
+- **CI/CD Pipeline**: Set up GitHub Actions for automated deployments
+- **Auto-scaling**: Add ECS Auto Scaling based on CPU/memory metrics
+- **CloudWatch Alarms**: Monitor costs and uptime
+- **Staging Environment**: Create separate environment for testing
+- **WAF**: Add Web Application Firewall rules to CloudFront
 
